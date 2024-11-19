@@ -126,7 +126,8 @@ class Project:
             "name": self.project_dir.name,
             "created_at": datetime.now().isoformat(),
             "llm_settings": {
-                "model": "qwen2.5-coder:32b",
+                #"model": "qwen2.5-coder:32b",
+                "model": "phi3.5",
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "top_k": 40
@@ -175,7 +176,7 @@ class Project:
 
 class LLMInterface:
     """Handles communication with Ollama API"""
-    def __init__(self, host: str = "127.0.0.1", port: int = 11434, model: str = "qwen2.5-coder:32b"):
+    def __init__(self, host: str = "127.0.0.1", port: int = 11434, model: str = "phi3.5"):
         self.base_url = f"http://{host}:{port}"
         self.model = model
         
@@ -257,118 +258,163 @@ class LLMInterface:
         except Exception as e:
             yield f"Error streaming response: {str(e)}"
 
+from typing import Dict, List, Optional, Tuple, Set
+from pathlib import Path
+import json
+
 class FileManager:
     """Enhanced file management with nested directory support and file selection"""
+    MAX_TOTAL_SIZE = 1024 * 1024 * 10  # 10MB limit for total selected files
+    ALLOWED_EXTENSIONS = {'.py', '.js', '.jsx', '.ts', '.tsx', '.html', '.css', '.md', '.txt', '.json'}
+    
     def __init__(self, project: Project):
         self.project = project
         self._selected_files: Set[str] = set()  # Store as relative paths
         
-    def get_file_tree(self) -> dict:
-        """Get nested directory structure with selection state
-        
-        Returns a tree structure where each node contains:
-        - type: "file" or "directory"
-        - name: name of the file or directory
-        - path: relative path from project root
-        - selected: boolean indicating if file is selected for context
-        - children: list of child nodes (for directories)
-        """
-        def build_tree(path: Path) -> dict:
-            relative_path = str(path.relative_to(self.project.project_dir))
-            
-            if path.is_file():
-                return {
-                    "type": "file",
-                    "name": path.name,
-                    "path": relative_path,
-                    "selected": relative_path in self._selected_files
-                }
-            
-            children = []
-            for child in sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name)):
-                # Skip metadata and history files
-                if child.name == "project_metadata.json" or child.name == "chat_history":
-                    continue
-                children.append(build_tree(child))
+    def is_valid_file(self, file_path: Path) -> bool:
+        """Check if file is valid for selection"""
+        try:
+            if not file_path.is_file():
+                return False
                 
-            return {
-                "type": "directory",
-                "name": path.name,
-                "path": relative_path if path != self.project.project_dir else "",
-                "children": children,
-                "selected": all(
-                    child.get("selected", False) 
-                    for child in children 
-                    if child["type"] == "file"
-                )
-            }
+            # Check file extension
+            if file_path.suffix.lower() not in self.ALLOWED_EXTENSIONS:
+                return False
+                
+            # Check file size
+            if file_path.stat().st_size > (self.MAX_TOTAL_SIZE / 10):  # Individual file limit
+                return False
+                
+            # Try to read first few bytes to ensure it's text
+            with file_path.open('rb') as f:
+                try:
+                    f.read(1024).decode('utf-8')
+                except UnicodeDecodeError:
+                    return False
+                    
+            return True
+        except Exception:
+            return False
             
-        return build_tree(self.project.project_dir)
+    def get_total_selected_size(self) -> int:
+        """Get total size of all selected files"""
+        total_size = 0
+        for file_path in self._selected_files:
+            try:
+                full_path = self.project.project_dir / file_path
+                if full_path.is_file():
+                    total_size += full_path.stat().st_size
+            except Exception:
+                continue
+        return total_size
         
     def toggle_file_selection(self, file_path: str, selected: bool = None) -> bool:
-        """Toggle or set selection state of a file
-        
-        Args:
-            file_path: Relative path from project root
-            selected: If provided, set to this value; if None, toggle current state
+        """Toggle or set selection state of a file"""
+        if not isinstance(file_path, str):
+            return False
             
-        Returns:
-            New selection state
-        """
-        if selected is None:
-            if file_path in self._selected_files:
-                self._selected_files.remove(file_path)
+        try:
+            # Check file validity when selecting
+            if selected and not self.is_valid_file(self.project.project_dir / file_path):
+                print(f"Warning: File {file_path} is not valid for selection")
                 return False
-            else:
+                
+            # Check total size when adding files
+            if selected and file_path not in self._selected_files:
+                new_total = self.get_total_selected_size()
+                try:
+                    new_total += (self.project.project_dir / file_path).stat().st_size
+                    if new_total > self.MAX_TOTAL_SIZE:
+                        print(f"Warning: Adding file would exceed size limit of {self.MAX_TOTAL_SIZE/1024/1024}MB")
+                        return False
+                except Exception:
+                    return False
+            
+            if selected is None:
+                if file_path in self._selected_files:
+                    self._selected_files.remove(file_path)
+                    return False
+                else:
+                    self._selected_files.add(file_path)
+                    return True
+            elif selected:
                 self._selected_files.add(file_path)
                 return True
-        elif selected:
-            self._selected_files.add(file_path)
-            return True
-        else:
-            self._selected_files.remove(file_path)
+            else:
+                self._selected_files.discard(file_path)
+                return False
+                
+        except Exception as e:
+            print(f"Error in toggle_file_selection: {str(e)}")
             return False
             
     def toggle_directory_selection(self, dir_path: str, selected: bool = None) -> List[Tuple[str, bool]]:
-        """Toggle or set selection state for all files in a directory
-        
-        Returns list of (file_path, new_state) for all affected files
-        """
-        dir_path = Path(dir_path) if dir_path else self.project.project_dir
+        """Toggle or set selection state for all files in a directory"""
         changes = []
-        
-        for file_path in dir_path.rglob("*"):
-            if file_path.is_file():
-                relative_path = str(file_path.relative_to(self.project.project_dir))
-                new_state = self.toggle_file_selection(relative_path, selected)
-                changes.append((relative_path, new_state))
+        try:
+            dir_path = Path(dir_path) if dir_path else self.project.project_dir
+            full_dir_path = self.project.project_dir / dir_path
+            
+            if not full_dir_path.exists():
+                return changes
                 
+            # First pass: check total size
+            if selected:
+                total_size = self.get_total_selected_size()
+                for file_path in full_dir_path.rglob("*"):
+                    if file_path.is_file():
+                        try:
+                            if self.is_valid_file(file_path):
+                                total_size += file_path.stat().st_size
+                        except Exception:
+                            continue
+                            
+                if total_size > self.MAX_TOTAL_SIZE:
+                    print(f"Warning: Selecting all files would exceed size limit of {self.MAX_TOTAL_SIZE/1024/1024}MB")
+                    return changes
+            
+            # Second pass: actually toggle files
+            for file_path in full_dir_path.rglob("*"):
+                if file_path.is_file():
+                    try:
+                        relative_path = str(file_path.relative_to(self.project.project_dir))
+                        new_state = self.toggle_file_selection(relative_path, selected)
+                        changes.append((relative_path, new_state))
+                    except Exception as e:
+                        print(f"Error processing file {file_path}: {str(e)}")
+                        continue
+                        
+            self.save_selection()
+            
+        except Exception as e:
+            print(f"Error in toggle_directory_selection: {str(e)}")
+            
         return changes
         
     def get_selected_files(self) -> Dict[str, str]:
-        """Get currently selected files and their contents
-        
-        Returns:
-            Dict mapping relative paths to file contents
-        """
+        """Get currently selected files and their contents"""
         selected_files = {}
         for file_path in self._selected_files:
-            full_path = self.project.project_dir / file_path
-            if full_path.is_file():  # Check in case file was deleted
-                try:
+            try:
+                full_path = self.project.project_dir / file_path
+                if full_path.is_file() and self.is_valid_file(full_path):
                     selected_files[file_path] = full_path.read_text()
-                except Exception as e:
-                    print(f"Error reading {file_path}: {e}")  # TODO: Proper error handling
+            except Exception as e:
+                print(f"Error reading {file_path}: {str(e)}")
+                continue
         return selected_files
         
     def save_selection(self):
         """Save current file selection to project metadata"""
-        self.project.metadata["selected_files"] = list(self._selected_files)
-        self.project._save_metadata()
-        
+        if hasattr(self.project, 'metadata'):
+            self.project.metadata["selected_files"] = list(self._selected_files)
+            self.project._save_metadata()
+            
     def load_selection(self):
         """Load file selection from project metadata"""
-        self._selected_files = set(self.project.metadata.get("selected_files", []))
+        if hasattr(self.project, 'metadata'):
+            self._selected_files = set(self.project.metadata.get("selected_files", []))
+
 
 class CodeEditorInterface:
     """Main interface combining all components"""
@@ -392,7 +438,8 @@ class CodeEditorInterface:
             # Update LLM settings from project
             settings = self.current_project.metadata.get("llm_settings", {})
             self.llm = LLMInterface(
-                model=settings.get("model", "qwen2.5-coder:32b")
+                #model=settings.get("model", "qwen2.5-coder:32b")
+                model=settings.get("model", "phi3.5")
             )
             return True
         return False
@@ -423,7 +470,7 @@ def create_ui() -> gr.Blocks:
                     value=ChatType.CODE_GENERATION.value,
                     label="Chat Type"
                 )
-                chatbot = gr.Chatbot(height=600)
+                chatbot = gr.Chatbot(height=650)
                 with gr.Row():
                     user_input = gr.Textbox(
                         show_label=False,
@@ -463,35 +510,43 @@ def create_ui() -> gr.Blocks:
                                 return []
                             
                             files = []
-                            tree = interface.current_project.file_manager.get_file_tree()
+                            project_dir = interface.current_project.project_dir
+                            file_manager = interface.current_project.file_manager
                             
-                            def process_node(node):
-                                if node["type"] == "file":
-                                    files.append([
-                                        node["selected"],  # Selected (bool)
-                                        "📄",              # Type (str)
-                                        node["path"]       # Path (str)
-                                    ])
-                                else:
-                                    if node["path"]:  # Skip root directory
+                            def process_node(path: Path, indent: int = 0):
+                                try:
+                                    relative_path = str(path.relative_to(project_dir))
+                                    if path.is_file():
+                                        is_selected = relative_path in file_manager._selected_files
                                         files.append([
-                                            node["selected"],
-                                            "📁",
-                                            f"{node['path']}/"
+                                            is_selected,  # Selected (bool)
+                                            "📄",        # Type (str)
+                                            relative_path # Path (str)
                                         ])
-                                    for child in node["children"]:
-                                        process_node(child)
+                                    else:  # Directory
+                                        if path != project_dir:  # Skip root directory
+                                            files.append([
+                                                False,  # Directories can't be directly selected
+                                                "📁",
+                                                f"{relative_path}/"
+                                            ])
+                                        # Process children
+                                        for child in sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name)):
+                                            if child.name != "project_metadata.json" and child.name != "chat_history":
+                                                process_node(child, indent + 1)
+                                except Exception as e:
+                                    print(f"Error processing {path}: {str(e)}")
                             
-                            process_node(tree)
+                            process_node(project_dir)
                             return files
-                        
+                            
                         def handle_selection_change(df):
                             """Handle changes in file selection"""
                             if not interface.current_project or df.empty:
                                 return df
                             
                             try:
-                                rows = df.values.tolist()
+                                rows = df.values.tolist()  # Correct way to iterate over dataframe
                                 for row in rows:
                                     if len(row) >= 3:
                                         selected = bool(row[0])  # First column (Selected)
@@ -511,7 +566,7 @@ def create_ui() -> gr.Blocks:
                                 print(f"Error in handle_selection_change: {str(e)}")
                                 
                             return update_file_tree()
-                        
+ 
                         def toggle_new_file_input():
                             """Toggle visibility of new file input"""
                             return gr.update(visible=True)
@@ -562,93 +617,7 @@ def create_ui() -> gr.Blocks:
                         select_all_btn.click(fn=select_all, outputs=[file_list])
                         clear_selection_btn.click(fn=clear_selection, outputs=[file_list])
                         file_list.change(fn=handle_selection_change, inputs=[file_list], outputs=[file_list])
-                    ## File Browser Tab
-                    #with gr.Tab("Files"):
-                    #    with gr.Row():
-                    #        refresh_btn = gr.Button("Refresh")
-                    #        new_file_btn = gr.Button("New File")
-                    #        select_all_btn = gr.Button("Select All")
-                    #        clear_selection_btn = gr.Button("Clear Selection")
-                    #    
-                    #    # Use a Dataframe for file selection instead of Markdown
-                    #    file_list = gr.Dataframe(
-                    #        headers=["Selected", "Type", "Path"],
-                    #        datatype=["bool", "str", "str"],
-                    #        interactive=True,
-                    #        col_count=(3, "fixed")
-                    #    )
-                    #    
-                    #    def update_file_tree():
-                    #        """Update the file list display"""
-                    #        if not interface.current_project:
-                    #            return []
-                    #        
-                    #        files = []
-                    #        tree = interface.current_project.file_manager.get_file_tree()
-                    #        
-                    #        def process_node(node):
-                    #            if node["type"] == "file":
-                    #                files.append([
-                    #                    node["selected"],
-                    #                    "📄",
-                    #                    node["path"]
-                    #                ])
-                    #            else:
-                    #                if node["path"]:  # Skip root directory
-                    #                    files.append([
-                    #                        node["selected"],
-                    #                        "📁",
-                    #                        f"{node['path']}/"
-                    #                    ])
-                    #                for child in node["children"]:
-                    #                    process_node(child)
-                    #        
-                    #        process_node(tree)
-                    #        return files
-                    #    
-                    #    def handle_selection_change(df):
-                    #        """Handle changes in file selection"""
-                    #        if not interface.current_project:
-                    #            return df
-                    #        
-                    #        for row in df:
-                    #            selected, type_icon, path = row
-                    #            if type_icon == "📁":  # Directory
-                    #                path = path.rstrip("/")
-                    #                interface.current_project.file_manager.toggle_directory_selection(
-                    #                    path, selected
-                    #                )
-                    #            else:  # File
-                    #                interface.current_project.file_manager.toggle_file_selection(
-                    #                    path, selected
-                    #                )
-                    #        
-                    #        interface.current_project.file_manager.save_selection()
-                    #        return update_file_tree()
-                    #    
-                    #    # Handle select all / clear selection
-                    #    def select_all():
-                    #        if interface.current_project:
-                    #            interface.current_project.file_manager.toggle_directory_selection(
-                    #                "", selected=True
-                    #            )
-                    #            interface.current_project.file_manager.save_selection()
-                    #        return update_file_tree()
-                    #        
-                    #    def clear_selection():
-                    #        if interface.current_project:
-                    #            interface.current_project.file_manager.toggle_directory_selection(
-                    #                "", selected=False
-                    #            )
-                    #            interface.current_project.file_manager.save_selection()
-                    #        return update_file_tree()
-                    #    
-                    #    # Set up event handlers
-                    #    refresh_btn.click(fn=update_file_tree, outputs=[file_list])
-                    #    select_all_btn.click(fn=select_all, outputs=[file_list])
-                    #    clear_selection_btn.click(fn=clear_selection, outputs=[file_list])
-                    #    file_list.change(fn=handle_selection_change, inputs=[file_list], outputs=[file_list])
-                    
+
                     # Project Settings Tab
                     with gr.Tab("Project"):
                         with gr.Row():
@@ -680,8 +649,9 @@ def create_ui() -> gr.Blocks:
                         gr.Markdown("### LLM Settings")
                         with gr.Row():
                             model_name = gr.Dropdown(
-                                choices=["qwen2.5-coder:32b", "codellama", "llama2", "mistral"],
-                                value="qwen2.5-coder:32b",
+                                choices=["phi3.5", "qwen2.5-coder:32b", "codellama:34b", "llama2", "mistral"],
+                                #value="qwen2.5-coder:32b",
+                                value="phi3.5",
                                 label="Model",
                                 interactive=True
                             )
@@ -762,13 +732,15 @@ def create_ui() -> gr.Blocks:
                                     settings = interface.current_project.metadata.get("llm_settings", {})
                                     return {
                                         current_project_label: f"Current Project: {name}",
-                                        model_name: settings.get("model", "qwen2.5-coder:32b"),
+                                        #model_name: settings.get("model", "qwen2.5-coder:32b"),
+                                        model_name: settings.get("model", "phi3.5"),
                                         temperature: settings.get("temperature", 0.7),
                                         top_p: settings.get("top_p", 0.9)
                                     }
                             return {
                                 current_project_label: "No project selected",
-                                model_name: "qwen2.5-coder:32b",
+                                #model_name: "qwen2.5-coder:32b",
+                                model_name: "phi3.5",
                                 temperature: 0.7,
                                 top_p: 0.9
                             }
@@ -808,12 +780,89 @@ def create_ui() -> gr.Blocks:
                         )
                     
                     # Chat History Tab
+                    # Chat History Tab
                     with gr.Tab("History"):
-                        history_type = gr.Dropdown(
-                            choices=[t.value for t in ChatType],
-                            label="History Type"
+                        with gr.Row():
+                            refresh_history_btn = gr.Button("Refresh History")
+                            history_dropdown = gr.Dropdown(
+                                label="Select Chat History",
+                                choices=[],
+                                interactive=True
+                            )
+                        
+                        history_display = gr.Chatbot(
+                            label="Chat History",
+                            height=500
                         )
-                        history_list = gr.JSON(label="Chat History")
+                        
+                        def list_history_files():
+                            if not interface.current_project:
+                                return [], gr.update()
+                            try:
+                                history_dir = interface.current_project.chat_history_dir
+                                files = list(history_dir.glob("*.json"))
+                                # Format the display names
+                                choices = []
+                                for f in files:
+                                    try:
+                                        # The filename format is: code_generation_20241118_222122.json
+                                        name_parts = f.stem.split('_')  # Split filename into parts
+                                        # Handle chat type (might be multiple parts like 'code' 'generation')
+                                        chat_type = ' '.join(name_parts[:-2]).title()
+                                        # Last two parts are date and time
+                                        date_str = name_parts[-2]
+                                        time_str = name_parts[-1]
+                                        
+                                        # Parse date and time
+                                        date = datetime.strptime(f"{date_str}_{time_str}", '%Y%m%d_%H%M%S')
+                                        display_name = f"{chat_type} - {date.strftime('%Y-%m-%d %H:%M:%S')}"
+                                        choices.append((display_name, str(f.name)))
+                                    except Exception as e:
+                                        print(f"Error parsing filename {f.name}: {e}")
+                                        # Add raw filename as fallback
+                                        choices.append((str(f.name), str(f.name)))
+                                
+                                return gr.update(choices=choices), gr.update()
+                            except Exception as e:
+                                print(f"Error listing history files: {e}")
+                                return [], gr.update()
+                        
+                        def load_history(filename):
+                            if not filename or not interface.current_project:
+                                return gr.update()
+                            try:
+                                history_path = interface.current_project.chat_history_dir / filename
+                                history_content = json.loads(history_path.read_text())
+                                return history_content
+                            except Exception as e:
+                                print(f"Error loading history: {e}")
+                                return []
+                        
+                        # Event handlers
+                        refresh_history_btn.click(
+                            fn=list_history_files,
+                            outputs=[history_dropdown, history_display]
+                        )
+                        
+                        history_dropdown.change(
+                            fn=load_history,
+                            inputs=[history_dropdown],
+                            outputs=[history_display]
+                        ) 
+                    #with gr.Tab("History"):
+                    #    gr.HTML("""
+                    #        <div id="chat-history-root"></div>
+                    #        <script type="module">
+                    #            import ChatHistoryViewer from './src/ChatHistoryViewer.jsx';
+                    #            
+                    #            const root = document.getElementById('chat-history-root');
+                    #            if (root && !root.hasChildNodes()) {
+                    #                ReactDOM.createRoot(root).render(
+                    #                    React.createElement(ChatHistoryViewer)
+                    #                );
+                    #            }
+                    #        </script>
+                    #    """)
 
         # Event handlers
         async def handle_chat(message: str, history: List[Tuple[str, str]]) -> Tuple[str, List[Tuple[str, str]]]:
